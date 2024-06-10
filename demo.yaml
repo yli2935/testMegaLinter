@@ -1,0 +1,151 @@
+name: Build Step
+
+on:
+  push:
+    branches: ['main']
+  pull_request:
+    types: [opened, synchronize, reopened]
+jobs:
+  build-node:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node-version: [20.6]
+
+    steps:
+      - uses: actions/checkout@v3
+        env:
+          GIT_SSL_NO_VERIFY: true
+        with:
+          repository: yli2935/sourceCode
+          token: ${{ secrets.G_TOKEN }}     
+
+      - name: Use Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v3
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: 'npm'
+      - name : Install dependencies
+        run: npm ci
+      - name: Build app
+        run: npm run build --if-present
+
+
+  sonarqube:
+    name: SonarQube Scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checking out
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: SonarQube Scan
+        uses: kitabisa/sonarqube-action@v1.2.0
+        with:
+          host: http://sonarqube-sonarqube-lts.sonarqube-lts.svc.cluster.local:9000
+          login: ${{ secrets.SONARQUBE_TOKEN }}
+
+  # test-stage:
+  #   runs-on: ubuntu-latest
+  #   needs: build
+  #   steps:
+  #     - name: Checkout code
+  #       uses: actions/checkout@v3
+  #       with:
+  #         fetch-depth: 0
+  #     - name: Super-linter
+  #       uses: super-linter/super-linter@v6.5.1  
+  #       env:
+  #         VALIDATE_ALL_CODEBASE: true
+  #         VALIDATE_JAVASCRIPT_ES: true
+  #         VALIDATE_HTML: true
+  #         GITHUB_TOKEN: ${{ secrets.G_TOKEN }}
+  #         REPORT_OUTPUT: reports/super-linter-report
+  #         OUTPUT_FORMAT: json
+  test-stage:
+    name: MegaLinter
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: MegaLinter
+        id: ml
+        uses: oxsecurity/megalinter/flavors/javascript@beta
+        env:
+          ENABLE: JAVASCRIPT_ES
+          LOG_LEVEL: DEBUG
+          GITHUB_TOKEN: ${{ secrets.G_TOKEN }}
+      - name: Archive production artifacts
+        if: success() || failure()
+        uses: actions/upload-artifact@v3
+        with:
+          name: MegaLinter reports
+          path: |
+            megalinter-reports
+            mega-linter.log      
+
+  build-and-push-docker-image:
+    name: Build Docker image and push to repositories
+    runs-on: ubuntu-latest
+    needs: ['build', 'test-stage']
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          repository: yli2935/sourceCode
+          ref: 'main'
+          token: ${{ secrets.G_TOKEN }}
+          
+      - name: Login to DockerHub
+        uses: docker/login-action@f4ef78c080cd8ba55a85445d5b36e214a81df20a
+        with:
+          username: ${{ secrets.DOCKER_USER }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Extract metadata (tags, labels) for Docker
+        id: meta
+        uses: docker/metadata-action@9ec57ed1fcdbf14dcef7dfbe97b2010124a938b7
+        with:
+          images: yli2935/gitops01
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image and push to Docker Hub 
+        id: push
+        uses: docker/build-push-action@v2
+        with:
+          context: ./
+          file: ./Dockerfile
+          push: true
+          tags: yli2935/gitops01:${{ gitea.sha }}
+            
+      - name: Image digest
+        run: echo ${{ steps.docker_build.outputs.digest }}
+  update-manifest-stage:
+    runs-on: ubuntu-latest
+    needs: ['build-and-push-docker-image']
+    steps:
+      - name: Checkout argo cd repo
+        uses: actions/checkout@v3
+        with:
+          repository: yli2935/test
+          ref: 'main'
+          token: ${{ secrets.G_TOKEN }}
+      - name: Update deployment.yaml
+        run: |
+          git config --global user.email "yli2935@uwo.ca"
+          git config --global user.name "yli2935"
+          echo ${{ gitea.sha }}
+          sed -i "s#${{ gitea.actor }}.*#${{ gitea.actor }}/sourceCode:${{ gitea.sha }}#g" app/deployment.yaml
+          git add -A
+          git commit -am "Update image for - ${{ gitea.sha }}"
+
+      - name: Push changes
+        run: |
+          git push origin main
+        env:
+          GITHUB_TOKEN: ${{ secrets.G_TOKEN }}
